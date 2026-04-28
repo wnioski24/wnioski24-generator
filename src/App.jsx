@@ -5,15 +5,15 @@ import { useState, useRef, useEffect } from "react";
 // ============================================================
 const CONFIG = {
   HOTPAY_URL: "https://platnosc.hotpay.pl",
-  HOTPAY_SEKRET: "eEY3MEVydnZvRVEyQWNvNzJWRWxlTmtORGpwU1c0TVpoMktMRkk4ZVQrVT0,",
+  HOTPAY_SEKRET: "R2NSV3EvZlRadjdHWDZldFk5b21SdE0zRnBsa2V0ZUZqR0tmeWVGc3lEND0,",
   // KWOTA i CENA_DISPLAY są pobierane dynamicznie z atrybutów elementu
   // lub z meta tagu ustawianego przez WordPress.
   // Ustaw cenę w WP: dodaj do strony shortcode [generator_pup_cena]
   // lub wpisz wprost poniżej jako fallback:
   HOTPAY_KWOTA_FALLBACK: "99.00",
   CENA_DISPLAY_FALLBACK: "99 zł",
-  RETURN_URL: "https://wnioski24.pl/generator-pup/?status=sukces",
-  FAILURE_URL: "https://wnioski24.pl/generator-pup/?status=blad",
+  RETURN_URL: "https://wnioski24-generator.vercel.app/?status=sukces",
+  FAILURE_URL: "https://wnioski24-generator.vercel.app/?status=blad",
   MAKE_WEBHOOK_URL: "https://hook.eu1.make.com/3wrmmyovepe2tqf5jckioc9df7wggyt0",
   REGULAMIN_URL: "https://wnioski24.pl/regulamin/",
   POLITYKA_URL: "https://wnioski24.pl/polityka-prywatnosci/",
@@ -246,17 +246,21 @@ export default function GeneratorPUP() {
     }
   }
 
-  // ── ETAP 1: Uzupełnianie braków ──────────────────────────
+  // ── ETAP 1: Uzupełnianie braków + opodatkowanie + 12M plan ─
   async function claudeEnrich(f) {
     const miasto = f.miejscowosc || "w Polsce";
-    const prompt = `Jesteś ekspertem od wniosków o dotacje z Urzędu Pracy (PUP) w Polsce.
-Klient podał dane o planowanej działalności. Uzupełnij WSZYSTKIE brakujące sekcje
-na podstawie kontekstu. Pisz jak ekspert biznesowy.
+    const maFinanse = !f.finanse_skip && f.przychody.some(r => r.kwota);
+    const przychodBaza = maFinanse
+      ? f.przychody.reduce((s, r) => s + (parseFloat(r.kwota) || 0), 0)
+      : null;
+
+    const prompt = `Jesteś ekspertem od wniosków o dotacje z Urzędu Pracy (PUP) w Polsce
+oraz doradcą podatkowym dla małych firm.
 
 WAŻNE ZASADY:
-- NIE używaj nazwy "Warszawa" ani żadnego konkretnego urzędu pracy w treściach wniosku
-- Konkurentów dobierz z okolicy: ${miasto} lub regionu – podaj realne, istniejące firmy
-- Dane branżowe i statystyki powinny dotyczyć całej Polski lub regionu, nie konkretnego miasta
+- NIE używaj nazw konkretnych miast ani urzędów pracy w treściach wniosku
+- Konkurentów dobierz z okolicy: ${miasto} – podaj realne, istniejące firmy
+- Dane branżowe dotyczą całej Polski, nie konkretnego miasta
 - Pisz w pierwszej osobie liczby pojedynczej
 
 DANE OD KLIENTA:
@@ -264,68 +268,97 @@ PKD: ${f.pkd1_kod} – ${f.pkd1_nazwa}
 ${f.pkd2_kod ? `PKD poboczne: ${f.pkd2_kod} – ${f.pkd2_nazwa}` : ""}
 Kwota dotacji: ${f.kwota} zł
 Termin: ${f.termin_podjecia || "nie podano"}
-Opis biznesu: ${f.opis_biznesu}
+Opis: ${f.opis_biznesu}
 Branża: ${f.branza || "nie podano"}
-Miejscowość działalności: ${miasto}
-Adres lokalu: ${f.adres_dzialalnosci || "nie podano"} (${f.status_lokalu || "nie podano"})
-Praca zdalna: ${f.praca_zdalna ? "tak" : "nie"}
-Klienci: ${f.klienci_skip ? "NIE PODANO – wygeneruj" : `${f.grupy_klientow} | ${f.sposob_pozyskania}`}
-Finanse: ${f.finanse_skip ? "NIE PODANO – wygeneruj realistyczne dla tej branży" : `przychody: ${f.przychody.map(r => `${r.nazwa} ${r.kwota}zł`).join(", ")}`}
-SWOT: ${f.swot_skip ? "NIE PODANO – wygeneruj" : `mocne: ${f.mocne.filter(Boolean).join(", ")} | słabe: ${f.slabe.filter(Boolean).join(", ")}`}
-Konkurencja: ${f.konkurencja_skip ? `NIE PODANO – dobierz 3 realne firmy z okolic ${miasto}` : f.konkurencja.filter(k => k.nazwa).map(k => `${k.nazwa}: ${k.opis}`).join(", ") || `NIE PODANO – dobierz 3 realne firmy z okolic ${miasto}`}
-Plan działań: ${f.plan_skip ? "NIE PODANO – wygeneruj harmonogram" : f.plan_dzialan.filter(p => p.dzialanie).map(p => `${p.termin}: ${p.dzialanie}`).join(", ") || "NIE PODANO – wygeneruj"}
-Zatrudnienie: ${f.zatrudnienie === "tak" ? f.zatrudnienie_szczegoly : "nie planowane"}
+Miejscowość: ${miasto}
+Lokal: ${f.adres_dzialalnosci || "praca zdalna"} (${f.status_lokalu || ""})
+Klienci: ${f.klienci_skip ? "wygeneruj" : `${f.grupy_klientow} | ${f.sposob_pozyskania}`}
+Przychód bazowy (mies.): ${przychodBaza ? przychodBaza + " zł" : "wygeneruj realistyczny dla tej branży"}
+Koszty stałe: ${f.finanse_skip ? "wygeneruj" : f.koszty_stale?.map(r => `${r.nazwa} ${r.kwota}zł`).join(", ") || "wygeneruj"}
+SWOT: ${f.swot_skip ? "wygeneruj" : `mocne: ${f.mocne.filter(Boolean).join(", ")}`}
+Konkurencja: ${f.konkurencja_skip ? `wygeneruj 3 firmy z ${miasto}` : f.konkurencja.filter(k => k.nazwa).map(k => k.nazwa).join(", ") || `wygeneruj 3 firmy z ${miasto}`}
+Plan działań: ${f.plan_skip ? "wygeneruj" : f.plan_dzialan.filter(p => p.dzialanie).map(p => p.dzialanie).join(", ") || "wygeneruj"}
+Zatrudnienie: ${f.zatrudnienie === "tak" ? f.zatrudnienie_szczegoly : "jednoosobowo"}
 Dodatkowe: ${f.dodatkowe_info || "brak"}
+
+ZADANIE 1 – DOBÓR FORMY OPODATKOWANIA:
+Na podstawie PKD ${f.pkd1_kod} (${f.pkd1_nazwa}) dobierz najkorzystniejszą formę opodatkowania.
+Zasady doboru:
+- Ryczałt ewidencjonowany: handel (PKD 45-47) 3%, gastronomia (PKD 56) 3%, IT/programowanie (PKD 62.01) 12%, usługi różne 8,5%, wolne zawody 17%
+- Podatek liniowy 19%: opłacalny gdy koszty > 50% przychodu i przychody > 150 000 zł/rok
+- Skala podatkowa 12%/32%: gdy dochód roczny < 120 000 zł i duże koszty
+- Uwzględnij składkę zdrowotną: ryczałt – ryczałtowa, liniowy – 4,9% dochodu, skala – 9% dochodu
+- ZUS preferencyjny przez pierwsze 24 miesiące: ~330 zł (bez chorobowego), po 24 mies. pełny ~1600 zł
+- NFZ: zależy od formy, przy ryczałcie – stała kwota ok. 381–572 zł
+
+ZADANIE 2 – PLAN FINANSOWY 12 MIESIĘCY:
+Wygeneruj realistyczny plan z WZROSTEM co kwartał (Q2 +15%, Q3 +32%, Q4 +52% vs Q1).
+Każdy miesiąc zawiera: 2-3 źródła przychodów, koszty stałe, koszty zmienne, podatek, ZUS+NFZ, dochód netto.
+${przychodBaza ? `Baza przychodów Q1: ${przychodBaza} zł/mies. (podane przez klienta)` : "Dobierz realistyczną bazę dla tej branży i miejscowości."}
+
+ZADANIE 3 – TREŚCI MERYTORYCZNE (uzupełnij brakujące):
+Wygeneruj brakujące sekcje opisowe wniosku.
 
 Odpowiedz TYLKO jako JSON (zero markdown, zero backtick-ów):
 {
-  "cel_przedsiewziecia": "2 zdania – cel i potrzeba realizacji",
-  "motywacja": "2-3 zdania – dlaczego wnioskodawca zakłada firmę",
-  "opis_glownej": "3-4 zdania – opis działalności głównej",
-  "opis_pobocznej": "2 zdania lub pusty string jeśli brak PKD2",
-  "zrodlo_pomyslu": "2 zdania – skąd pomysł",
-  "plany_rozwoju": "3 zdania – plan na 1-3 lata",
-  "termin_podjecia": "miesiąc i rok jeśli nie podano",
-  "branza_opis": "3-4 zdania z danymi o branży w Polsce (realistyczne liczby)",
-  "grupy_klientow": "2-3 zdania – kto jest klientem",
-  "charakterystyka_klientow": "2-3 zdania – profil klienta",
-  "popyt_uzasadnienie": "2-3 zdania – dlaczego klienci będą kupować",
-  "sposob_pozyskania": "2-3 zdania – jak zdobyć pierwszych klientów",
-  "metody_utrzymania": "2 zdania – jak utrzymać klientów",
-  "lokalizacja_opis": "2-3 zdania o lokalizacji (bez nazwy konkretnego urzędu pracy)",
-  "plusy_lokalizacji": "2 plusy",
-  "minusy_lokalizacji": "1-2 minusy",
-  "sposob_zarzadzania": "2-3 zdania o zarządzaniu",
-  "dostawcy": "2-3 zdania o dostawcach",
-  "roznice_konkurencja": "3 zdania – czym wyróżnia się ta działalność",
-  "swot_mocne": ["punkt 1", "punkt 2", "punkt 3", "punkt 4", "punkt 5"],
-  "swot_slabe": ["punkt 1", "punkt 2", "punkt 3"],
-  "swot_szanse": ["punkt 1", "punkt 2", "punkt 3", "punkt 4"],
-  "swot_zagrozenia": ["punkt 1", "punkt 2", "punkt 3"],
+  "opodatkowanie": {
+    "forma": "nazwa formy np. Ryczałt ewidencjonowany",
+    "stawka": "np. 8,5%",
+    "podstawa": "przychód lub dochód",
+    "zus_miesiac": 330,
+    "nfz_miesiac": 381,
+    "uzasadnienie": "3-4 zdania dlaczego ta forma jest najlepsza dla tej branży i PKD"
+  },
+  "plan_12m": [
+    {
+      "miesiac": 1,
+      "nazwa_miesiaca": "Styczeń",
+      "przychody": [
+        {"nazwa": "źródło 1", "kwota": 0},
+        {"nazwa": "źródło 2", "kwota": 0}
+      ],
+      "suma_przychodow": 0,
+      "koszty_stale": 0,
+      "koszty_zmienne": 0,
+      "podatek": 0,
+      "zus_nfz": 0,
+      "dochod_netto": 0
+    }
+  ],
+  "cel_przedsiewziecia": "2 zdania",
+  "motywacja": "2-3 zdania",
+  "opis_glownej": "3-4 zdania",
+  "opis_pobocznej": "2 zdania lub pusty string",
+  "zrodlo_pomyslu": "2 zdania",
+  "plany_rozwoju": "3 zdania",
+  "termin_podjecia": "miesiąc rok",
+  "branza_opis": "3-4 zdania z liczbami",
+  "grupy_klientow": "2-3 zdania",
+  "charakterystyka_klientow": "2-3 zdania",
+  "popyt_uzasadnienie": "2-3 zdania",
+  "sposob_pozyskania": "2-3 zdania",
+  "metody_utrzymania": "2 zdania",
+  "lokalizacja_opis": "2-3 zdania",
+  "sposob_zarzadzania": "2-3 zdania",
+  "dostawcy": "2-3 zdania",
+  "roznice_konkurencja": "3 zdania",
+  "swot_mocne": ["p1","p2","p3","p4","p5"],
+  "swot_slabe": ["p1","p2","p3"],
+  "swot_szanse": ["p1","p2","p3","p4"],
+  "swot_zagrozenia": ["p1","p2","p3"],
   "konkurencja_3": [
-    {"nazwa": "realna firma z ${miasto} lub regionu", "adres": "miasto", "opis": "czym się zajmuje"},
-    {"nazwa": "realna firma z ${miasto} lub regionu", "adres": "miasto", "opis": "czym się zajmuje"},
-    {"nazwa": "realna firma z ${miasto} lub regionu", "adres": "miasto", "opis": "czym się zajmuje"}
+    {"nazwa": "firma z ${miasto}","adres": "miasto","opis": "zakres"},
+    {"nazwa": "firma z ${miasto}","adres": "miasto","opis": "zakres"},
+    {"nazwa": "firma z ${miasto}","adres": "miasto","opis": "zakres"}
   ],
   "plan_dzialan_tabela": [
-    {"termin": "miesiąc rok", "dzialanie": "opis działania", "efekt": "efekt"},
-    {"termin": "miesiąc rok", "dzialanie": "opis działania", "efekt": "efekt"},
-    {"termin": "miesiąc rok", "dzialanie": "opis działania", "efekt": "efekt"},
-    {"termin": "miesiąc rok", "dzialanie": "opis działania", "efekt": "efekt"},
-    {"termin": "miesiąc rok", "dzialanie": "opis działania", "efekt": "efekt"}
+    {"termin": "mies. rok","dzialanie": "opis","efekt": "efekt"},
+    {"termin": "mies. rok","dzialanie": "opis","efekt": "efekt"},
+    {"termin": "mies. rok","dzialanie": "opis","efekt": "efekt"},
+    {"termin": "mies. rok","dzialanie": "opis","efekt": "efekt"},
+    {"termin": "mies. rok","dzialanie": "opis","efekt": "efekt"}
   ],
-  "przychody_miesiezne": [
-    {"nazwa": "źródło przychodu", "kwota": "liczba"},
-    {"nazwa": "źródło przychodu", "kwota": "liczba"}
-  ],
-  "koszty_stale": [
-    {"nazwa": "ZUS przedsiębiorcy", "kwota": "1600"},
-    {"nazwa": "koszt stały", "kwota": "liczba"}
-  ],
-  "koszty_zmienne": [
-    {"nazwa": "koszt zmienny", "kwota": "liczba"}
-  ],
-  "uzasadnienie_finansowe": "3-4 zdania uzasadniające prognozy"
+  "uzasadnienie_finansowe": "4 zdania uzasadniające prognozy i wzrost"
 }`;
 
     const res  = await fetch("https://api.anthropic.com/v1/messages", {
@@ -333,7 +366,7 @@ Odpowiedz TYLKO jako JSON (zero markdown, zero backtick-ów):
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 1000,
+        max_tokens: 4000,
         messages: [{ role: "user", content: prompt }],
       }),
     });
@@ -345,36 +378,36 @@ Odpowiedz TYLKO jako JSON (zero markdown, zero backtick-ów):
   // ── ETAP 2: Profesjonalne treści ─────────────────────────
   async function claudeWrite(f, enriched) {
     const miasto = f.miejscowosc || "w Polsce";
-    const prompt = `Jesteś doświadczonym konsultantem biznesowym specjalizującym się w pisaniu
-wniosków o dofinansowanie z Urzędu Pracy w Polsce. Napisz PROFESJONALNE,
-ROZBUDOWANE i PRZEKONUJĄCE treści do wniosku o jednorazowe środki na podjęcie
-działalności gospodarczej (pomoc de minimis).
+    const opod = enriched.opodatkowanie || {};
+    const prompt = `Jesteś doświadczonym konsultantem biznesowym piszącym wnioski o dofinansowanie
+z Urzędu Pracy w Polsce. Napisz PROFESJONALNE, ROZBUDOWANE i PRZEKONUJĄCE treści.
 
 KLUCZOWE ZASADY:
-- NIE wymieniaj żadnej konkretnej nazwy urzędu pracy ani miasta w treściach wniosku
-- Pisz ogólnie: "lokalny rynek", "okolica", "region" zamiast nazw miast
+- NIE wymieniaj żadnej konkretnej nazwy urzędu pracy ani miasta w treściach
+- Pisz ogólnie: "lokalny rynek", "okolica", "region"
 - Każda sekcja: min. 4-5 zdań, formalny język, pierwsza osoba l. poj.
-- Uwzględnij lokalny kontekst rynkowy: ${miasto}
+- Kontekst rynkowy: ${miasto}
 
 DANE BAZOWE:
 PKD: ${f.pkd1_kod} – ${f.pkd1_nazwa}
-Kwota: ${f.kwota} zł
-Miejscowość: ${miasto}
+Kwota dotacji: ${f.kwota} zł
 Opis klienta: ${f.opis_biznesu}
+Forma opodatkowania: ${opod.forma || "ryczałt"} (${opod.stawka || ""})
+Uzasadnienie opodatkowania: ${opod.uzasadnienie || ""}
 
-DANE UZUPEŁNIONE (etap 1):
+DANE Z ETAPU 1:
 ${JSON.stringify(enriched, null, 2)}
 
 Odpowiedz TYLKO jako JSON (zero markdown):
 {
-  "s1_cel": "min. 4 zdania – cel i uzasadnienie przedsięwzięcia",
+  "s1_cel": "min. 4 zdania – cel i uzasadnienie",
   "s1_motywacja": "min. 4 zdania – motywacja zawodowa i osobista",
-  "s1_plany": "min. 4 zdania – plany rozwoju na 3 lata",
-  "s1_opis_glownej": "min. 5 zdań – szczegółowy opis działalności głównej",
+  "s1_plany": "min. 4 zdania – plany rozwoju na 3 lata z konkretnymi celami",
+  "s1_opis_glownej": "min. 5 zdań – szczegółowy opis działalności",
   "s1_opis_pobocznej": "min. 3 zdania lub pusty string",
   "s1_zrodlo": "min. 3 zdania – źródło pomysłu",
-  "s1_rynek": "min. 5 zdań – analiza rynku z danymi i statystykami ogólnopolskimi",
-  "s1_branza": "min. 5 zdań – opis branży z liczbami (bez nazw konkretnych miast)",
+  "s1_rynek": "min. 5 zdań – analiza rynku z danymi ogólnopolskimi",
+  "s1_branza": "min. 5 zdań – opis branży z liczbami",
   "s1_roznice": "min. 4 zdania – wyróżniki na tle konkurencji",
   "s1_przewaga": "min. 3 zdania – przewaga konkurencji i plan minimalizacji",
   "s2_grupy": "min. 3 zdania – grupy klientów",
@@ -382,14 +415,15 @@ Odpowiedz TYLKO jako JSON (zero markdown):
   "s2_popyt": "min. 3 zdania – uzasadnienie popytu",
   "s2_pozyskanie": "min. 4 zdania – strategia pozyskania klientów",
   "s2_utrzymanie": "min. 3 zdania – metody utrzymania klientów",
-  "s3_lokalizacja": "min. 3 zdania – opis lokalizacji (bez nazwy konkretnego PUP)",
-  "s3_plusy_minusy": "min. 3 zdania – plusy i minusy lokalizacji",
+  "s3_lokalizacja": "min. 3 zdania – opis lokalizacji",
+  "s3_plusy_minusy": "min. 3 zdania – plusy i minusy",
   "s3_wplyw": "min. 3 zdania – wpływ lokalizacji na biznes",
   "s4_zarzadzanie": "min. 3 zdania – sposób zarządzania",
   "s4_dostawcy": "min. 3 zdania – dostawcy i współpraca",
-  "plan_dzialan_opis": "min. 2 zdania – wprowadzenie do planu działań",
-  "finanse_uzasadnienie": "min. 4 zdania – uzasadnienie prognoz finansowych",
-  "wydatki_uzasadnienie": "min. 3 zdania – uzasadnienie wydatków z dotacji"
+  "plan_dzialan_opis": "min. 2 zdania – wprowadzenie do harmonogramu",
+  "opodatkowanie_uzasadnienie": "min. 4 zdania – dlaczego wybrana forma opodatkowania jest najkorzystniejsza, uwzględnij składkę zdrowotną i ZUS",
+  "finanse_uzasadnienie": "min. 4 zdania – uzasadnienie prognoz z uwzględnieniem wzrostu 15% co kwartał i wybranej formy opodatkowania",
+  "wydatki_uzasadnienie": "min. 3 zdania – uzasadnienie całości wydatków z dotacji"
 }`;
 
     const res  = await fetch("https://api.anthropic.com/v1/messages", {
