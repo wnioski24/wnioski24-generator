@@ -361,7 +361,7 @@ Odpowiedz TYLKO jako JSON (zero markdown, zero backtick-ów):
   "uzasadnienie_finansowe": "4 zdania uzasadniające prognozy i wzrost"
 }`;
 
-    const res  = await fetch("https://api.anthropic.com/v1/messages", {
+    const res  = await fetch("https://wnioski24-docx-server.onrender.com/claude", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -426,7 +426,7 @@ Odpowiedz TYLKO jako JSON (zero markdown):
   "wydatki_uzasadnienie": "min. 3 zdania – uzasadnienie całości wydatków z dotacji"
 }`;
 
-    const res  = await fetch("https://api.anthropic.com/v1/messages", {
+    const res  = await fetch("https://wnioski24-docx-server.onrender.com/claude", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
