@@ -14,7 +14,7 @@ const CONFIG = {
   CENA_DISPLAY_FALLBACK: "99 zł",
   RETURN_URL: "https://wnioski24-generator.vercel.app/?status=sukces",
   FAILURE_URL: "https://wnioski24-generator.vercel.app/?status=blad",
-  MAKE_WEBHOOK_URL: "https://hook.eu1.make.com/3wrmmyovepe2tqf5jckioc9df7wggyt0",
+  MAKE_WEBHOOK_URL: "https://hook.eu1.make.com/2kke2q2p33bpw6ckthlygj5hn21o3sa3",
   REGULAMIN_URL: "https://wnioski24.pl/regulamin/",
   POLITYKA_URL: "https://wnioski24.pl/polityka-prywatnosci/",
 };
