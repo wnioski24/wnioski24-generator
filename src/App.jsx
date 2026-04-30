@@ -372,7 +372,17 @@ Odpowiedz TYLKO jako JSON (zero markdown, zero backtick-ów):
     });
     const data = await res.json();
     const raw  = data.content.map(i => i.text || "").join("");
-    return JSON.parse(raw.replace(/```json|```/g, "").trim());
+    const cleaned = raw
+  .replace(/```json|```/g, "")
+  .replace(/[\u0000-\u001F\u007F-\u009F]/g, " ")
+  .trim();
+try {
+  return JSON.parse(cleaned);
+} catch(e) {
+  console.error("JSON parse error:", e.message);
+  console.error("Raw:", cleaned.substring(0, 500));
+  throw new Error("Błąd parsowania odpowiedzi AI: " + e.message);
+}
   }
 
   // ── ETAP 2: Profesjonalne treści ─────────────────────────
@@ -431,13 +441,23 @@ Odpowiedz TYLKO jako JSON (zero markdown):
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514",
-        max_tokens: 4000,
+        max_tokens: 8000,
         messages: [{ role: "user", content: prompt }],
       }),
     });
     const resp = await res.json();
     const raw  = resp.content.map(i => i.text || "").join("");
-    return JSON.parse(raw.replace(/```json|```/g, "").trim());
+    const cleaned = raw
+  .replace(/```json|```/g, "")
+  .replace(/[\u0000-\u001F\u007F-\u009F]/g, " ")
+  .trim();
+try {
+  return JSON.parse(cleaned);
+} catch(e) {
+  console.error("JSON parse error:", e.message);
+  console.error("Raw:", cleaned.substring(0, 500));
+  throw new Error("Błąd parsowania odpowiedzi AI: " + e.message);
+}
   }
 
   // ── Render ────────────────────────────────────────────────
