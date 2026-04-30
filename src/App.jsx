@@ -262,6 +262,7 @@ WAŻNE ZASADY:
 - Konkurentów dobierz z okolicy: ${miasto} – podaj realne, istniejące firmy
 - Dane branżowe dotyczą całej Polski, nie konkretnego miasta
 - Pisz w pierwszej osobie liczby pojedynczej
+- WAŻNE: Odpowiadaj TYLKO czystym JSON bez żadnych komentarzy, apostrofów w kluczach, znaków nowej linii wewnątrz wartości. Każda wartość string musi być w podwójnych cudzysłowach. Nie używaj apostrofów ani cudzysłowów wewnątrz wartości tekstowych.
 
 DANE OD KLIENTA:
 PKD: ${f.pkd1_kod} – ${f.pkd1_nazwa}
