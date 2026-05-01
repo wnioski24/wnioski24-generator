@@ -212,38 +212,106 @@ export default function GeneratorPUP() {
     };
     setTimeout(advanceStage, STAGE_DURATIONS[0]);
 
-    try {
-      const enriched = await claudeEnrich(formData);
-      const ai       = await claudeWrite(formData, enriched);
+    // KAŻDY krok ma własny try/catch — webhook MUSI się odpalić nawet przy błędzie
+    // AI, żeby Make.com mogło zrobić alert/refund (klient już zapłacił przez HotPay).
+    const order_id = `PUP-${Date.now()}`;
+    let enriched = null;
+    let ai = null;
+    let aiError = null;
 
-      await fetch(CONFIG.MAKE_WEBHOOK_URL, {
+    try {
+      enriched = await claudeEnrich(formData);
+    } catch (err) {
+      console.error("claudeEnrich failed:", err);
+      aiError = { stage: "enrich", message: err.message };
+    }
+
+    if (enriched && !aiError) {
+      try {
+        ai = await claudeWrite(formData, enriched);
+      } catch (err) {
+        console.error("claudeWrite failed:", err);
+        aiError = { stage: "write", message: err.message };
+      }
+    }
+
+    const meta = {
+      timestamp: new Date().toISOString(),
+      order_id,
+      email_klienta: formData.email,
+      imie_nazwisko: formData.imie_nazwisko,
+      kwota_wnioskowana: formData.kwota,
+      pkd: `${formData.pkd1_kod} – ${formData.pkd1_nazwa}`,
+      miejscowosc: formData.miejscowosc,
+      suma_wydatkow: sumWyd(formData.wydatki_dotacja),
+      ai_status: aiError ? "error" : "ok",
+      ai_error: aiError,
+    };
+
+    let webhookOk = false;
+    try {
+      const r = await fetch(CONFIG.MAKE_WEBHOOK_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          formularz: formData,
-          ai_tresc: ai,
-          enriched,
-          meta: {
-            timestamp: new Date().toISOString(),
-            order_id: `PUP-${Date.now()}`,
-            email_klienta: formData.email,
-            imie_nazwisko: formData.imie_nazwisko,
-            kwota_wnioskowana: formData.kwota,
-            pkd: `${formData.pkd1_kod} – ${formData.pkd1_nazwa}`,
-            miejscowosc: formData.miejscowosc,
-            suma_wydatkow: sumWyd(formData.wydatki_dotacja),
-          },
-        }),
+        body: JSON.stringify({ formularz: formData, ai_tresc: ai, enriched, meta }),
       });
-
-      localStorage.removeItem("pup_order_data");
-      setGenStep(4);
-      setGenStage(GEN_STAGES[4]);
-      setTimeout(() => setStatus("done"), 2000);
+      webhookOk = r.ok;
+      if (!r.ok) console.error("Make webhook non-2xx:", r.status, await r.text().catch(() => ""));
     } catch (err) {
-      console.error(err);
-      setStatus("error");
+      console.error("Make webhook failed:", err);
     }
+
+    if (aiError || !webhookOk) {
+      setStatus("error");
+      return;
+    }
+
+    localStorage.removeItem("pup_order_data");
+    setGenStep(4);
+    setGenStage(GEN_STAGES[4]);
+    setTimeout(() => setStatus("done"), 2000);
+  }
+
+  // ── Claude API helper z tool_use (wymusza poprawny JSON) + retry ────────
+  // Anthropic gwarantuje że tool_use.input jest poprawnym obiektem zgodnym ze
+  // schemą — eliminuje "Unterminated string" / błędy parsowania JSON z tekstu.
+  async function callClaudeJSON({ prompt, tool, attempts = 2 }) {
+    let lastErr;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        const res = await fetch("https://wnioski24-docx-server.onrender.com/claude", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: "claude-sonnet-4-20250514",
+            max_tokens: 16000,
+            tools: [tool],
+            tool_choice: { type: "tool", name: tool.name },
+            messages: [{ role: "user", content: prompt }],
+          }),
+        });
+        if (!res.ok) {
+          const errBody = await res.text();
+          throw new Error(`Claude API ${res.status}: ${errBody.slice(0, 300)}`);
+        }
+        const data = await res.json();
+        const toolUse = (data.content || []).find(b => b.type === "tool_use");
+        if (toolUse && toolUse.input) return toolUse.input;
+
+        // Fallback: model nie użył tool_use — spróbuj sparsować tekst
+        const raw = (data.content || []).map(b => b.text || "").join("");
+        const cleaned = raw
+          .replace(/```json|```/g, "")
+          .replace(/[\u0000-\u001F\u007F-\u009F]/g, " ")
+          .trim();
+        return JSON.parse(cleaned);
+      } catch (e) {
+        lastErr = e;
+        console.warn(`Claude attempt ${i + 1}/${attempts} failed:`, e.message);
+        if (i < attempts - 1) await new Promise(r => setTimeout(r, 1500 * (i + 1)));
+      }
+    }
+    throw lastErr;
   }
 
   // ── ETAP 1: Uzupełnianie braków + opodatkowanie + 12M plan ─
@@ -362,28 +430,103 @@ Odpowiedz TYLKO jako JSON (zero markdown, zero backtick-ów):
   "uzasadnienie_finansowe": "4 zdania uzasadniające prognozy i wzrost"
 }`;
 
-    const res  = await fetch("https://wnioski24-docx-server.onrender.com/claude", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 8000,
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
-    const data = await res.json();
-    const raw  = data.content.map(i => i.text || "").join("");
-    const cleaned = raw
-  .replace(/```json|```/g, "")
-  .replace(/[\u0000-\u001F\u007F-\u009F]/g, " ")
-  .trim();
-try {
-  return JSON.parse(cleaned);
-} catch(e) {
-  console.error("JSON parse error:", e.message);
-  console.error("Raw:", cleaned.substring(0, 500));
-  throw new Error("Błąd parsowania odpowiedzi AI: " + e.message);
-}
+    const enrichTool = {
+      name: "wniosek_enrich",
+      description: "Uzupełnia brakujące pola wniosku PUP: opodatkowanie, plan 12 miesięcy, treści merytoryczne, SWOT, konkurencja.",
+      input_schema: {
+        type: "object",
+        properties: {
+          opodatkowanie: {
+            type: "object",
+            properties: {
+              forma: { type: "string" },
+              stawka: { type: "string" },
+              podstawa: { type: "string" },
+              zus_miesiac: { type: "number" },
+              nfz_miesiac: { type: "number" },
+              uzasadnienie: { type: "string" },
+            },
+            required: ["forma", "stawka", "podstawa", "zus_miesiac", "nfz_miesiac", "uzasadnienie"],
+          },
+          plan_12m: {
+            type: "array",
+            minItems: 12,
+            maxItems: 12,
+            items: {
+              type: "object",
+              properties: {
+                miesiac: { type: "integer" },
+                nazwa_miesiaca: { type: "string" },
+                przychody: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    properties: { nazwa: { type: "string" }, kwota: { type: "number" } },
+                    required: ["nazwa", "kwota"],
+                  },
+                },
+                suma_przychodow: { type: "number" },
+                koszty_stale: { type: "number" },
+                koszty_zmienne: { type: "number" },
+                podatek: { type: "number" },
+                zus_nfz: { type: "number" },
+                dochod_netto: { type: "number" },
+              },
+              required: ["miesiac", "nazwa_miesiaca", "przychody", "suma_przychodow", "koszty_stale", "koszty_zmienne", "podatek", "zus_nfz", "dochod_netto"],
+            },
+          },
+          cel_przedsiewziecia: { type: "string" },
+          motywacja: { type: "string" },
+          opis_glownej: { type: "string" },
+          opis_pobocznej: { type: "string" },
+          zrodlo_pomyslu: { type: "string" },
+          plany_rozwoju: { type: "string" },
+          termin_podjecia: { type: "string" },
+          branza_opis: { type: "string" },
+          grupy_klientow: { type: "string" },
+          charakterystyka_klientow: { type: "string" },
+          popyt_uzasadnienie: { type: "string" },
+          sposob_pozyskania: { type: "string" },
+          metody_utrzymania: { type: "string" },
+          lokalizacja_opis: { type: "string" },
+          sposob_zarzadzania: { type: "string" },
+          dostawcy: { type: "string" },
+          roznice_konkurencja: { type: "string" },
+          swot_mocne: { type: "array", items: { type: "string" } },
+          swot_slabe: { type: "array", items: { type: "string" } },
+          swot_szanse: { type: "array", items: { type: "string" } },
+          swot_zagrozenia: { type: "array", items: { type: "string" } },
+          konkurencja_3: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                nazwa: { type: "string" },
+                adres: { type: "string" },
+                opis: { type: "string" },
+              },
+              required: ["nazwa", "adres", "opis"],
+            },
+          },
+          plan_dzialan_tabela: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                termin: { type: "string" },
+                dzialanie: { type: "string" },
+                efekt: { type: "string" },
+              },
+              required: ["termin", "dzialanie", "efekt"],
+            },
+          },
+          uzasadnienie_finansowe: { type: "string" },
+        },
+        required: ["opodatkowanie", "plan_12m", "cel_przedsiewziecia", "motywacja", "opis_glownej", "swot_mocne", "swot_slabe", "swot_szanse", "swot_zagrozenia", "konkurencja_3", "plan_dzialan_tabela", "uzasadnienie_finansowe"],
+      },
+    };
+
+    return await callClaudeJSON({ prompt, tool: enrichTool });
   }
 
   // ── ETAP 2: Profesjonalne treści ─────────────────────────
@@ -437,28 +580,27 @@ Odpowiedz TYLKO jako JSON (zero markdown):
   "wydatki_uzasadnienie": "min. 3 zdania – uzasadnienie całości wydatków z dotacji"
 }`;
 
-    const res  = await fetch("https://wnioski24-docx-server.onrender.com/claude", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 8000,
-        messages: [{ role: "user", content: prompt }],
-      }),
-    });
-    const resp = await res.json();
-    const raw  = resp.content.map(i => i.text || "").join("");
-    const cleaned = raw
-  .replace(/```json|```/g, "")
-  .replace(/[\u0000-\u001F\u007F-\u009F]/g, " ")
-  .trim();
-try {
-  return JSON.parse(cleaned);
-} catch(e) {
-  console.error("JSON parse error:", e.message);
-  console.error("Raw:", cleaned.substring(0, 500));
-  throw new Error("Błąd parsowania odpowiedzi AI: " + e.message);
-}
+    const writeFields = [
+      "s1_cel","s1_motywacja","s1_plany","s1_opis_glownej","s1_opis_pobocznej",
+      "s1_zrodlo","s1_rynek","s1_branza","s1_roznice","s1_przewaga",
+      "s2_grupy","s2_charakterystyka","s2_popyt","s2_pozyskanie","s2_utrzymanie",
+      "s3_lokalizacja","s3_plusy_minusy","s3_wplyw",
+      "s4_zarzadzanie","s4_dostawcy",
+      "plan_dzialan_opis","opodatkowanie_uzasadnienie","finanse_uzasadnienie","wydatki_uzasadnienie",
+    ];
+    const writeProperties = Object.fromEntries(writeFields.map(k => [k, { type: "string" }]));
+
+    const writeTool = {
+      name: "wniosek_write",
+      description: "Generuje profesjonalne treści narracyjne wniosku PUP – wszystkie sekcje pisane w pierwszej osobie l. poj.",
+      input_schema: {
+        type: "object",
+        properties: writeProperties,
+        required: writeFields.filter(k => k !== "s1_opis_pobocznej"),
+      },
+    };
+
+    return await callClaudeJSON({ prompt, tool: writeTool });
   }
 
   // ── Render ────────────────────────────────────────────────
