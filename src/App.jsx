@@ -8,16 +8,34 @@ const CONFIG = {
   HOTPAY_SEKRET: "R2NSV3EvZlRadjdHWDZldFk5b21SdE0zRnBsa2V0ZUZqR0tmeWVGc3lEND0,",
   // KWOTA i CENA_DISPLAY są pobierane dynamicznie z atrybutów elementu
   // lub z meta tagu ustawianego przez WordPress.
-  // Ustaw cenę w WP: dodaj do strony shortcode [generator_pup_cena]
-  // lub wpisz wprost poniżej jako fallback:
   HOTPAY_KWOTA_FALLBACK: "99.00",
   CENA_DISPLAY_FALLBACK: "99 zł",
+  // Backend (Render) — używany do /order-create i /order-status/:id
+  API_BASE: "https://wnioski24-docx-server.onrender.com",
+  // Frontend wraca tu po płatności — polling startuje na tej stronie
   RETURN_URL: "https://wnioski24-generator.vercel.app/?status=sukces",
   FAILURE_URL: "https://wnioski24-generator.vercel.app/?status=blad",
-  MAKE_WEBHOOK_URL: "https://hook.eu1.make.com/2kke2q2p33bpw6ckthlygj5hn21o3sa3",
   REGULAMIN_URL: "https://wnioski24.pl/regulamin/",
   POLITYKA_URL: "https://wnioski24.pl/polityka-prywatnosci/",
 };
+
+// Detekcja płci po pierwszym imieniu — używana do podpowiedzi gramatycznej
+// w promptach AI ("Jestem zmotywowany" vs "Jestem zmotywowana").
+// Heurystyka: imię kończące się na -a → kobieta, poza wyjątkami.
+function detectGender(imieNazwisko) {
+  if (!imieNazwisko) return "M";
+  const first = imieNazwisko.trim().split(/\s+/)[0]
+    .toLowerCase()
+    .replace(/[^a-ząćęłńóśźż]/g, "");
+  if (!first) return "M";
+  const maleEndingA = new Set([
+    "kuba","barnaba","bonawentura","kosma","jeremiasza","jonasza",
+    "perykles","sasza","mikita","attyla",
+  ]);
+  if (maleEndingA.has(first)) return "M";
+  if (first.endsWith("a")) return "F";
+  return "M";
+}
 
 // Dynamiczne pobieranie ceny – zmieniasz TYLKO w WordPressie
 // Dodaj meta tag do strony: <meta name="pup-cena" content="149.00">
@@ -101,20 +119,69 @@ export default function GeneratorPUP() {
   const [cena]                    = useState(() => getCena()); // dynamiczna cena
   const topRef = useRef();
 
-  // Sprawdź powrót z HotPay
+  const [orderId, setOrderId] = useState(null);
+
+  // Sprawdź powrót z HotPay → uruchom polling stanu zamówienia
   useEffect(() => {
     const p = new URLSearchParams(window.location.search);
     const s = p.get("status");
-    const saved = localStorage.getItem("pup_order_data");
-    if (s === "sukces" && saved) {
-      const parsed = JSON.parse(saved);
-      setData(parsed);
+    const order = p.get("order");
+    if (s === "sukces" && order) {
+      setOrderId(order);
       setStatus("generating");
-      runGeneration(parsed);
+      pollOrderStatus(order);
     } else if (s === "blad") {
       setStatus("error");
     }
   }, []);
+
+  // Polling stanu zamówienia z backendu — co 15s, max 30 min
+  function pollOrderStatus(orderIdToPoll) {
+    let attempts = 0;
+    const MAX_ATTEMPTS = 120; // 120 × 15s = 30 min
+    const STAGE_BY_STATUS = {
+      CREATED:        { step: 0, label: "⏳ Oczekiwanie na potwierdzenie płatności..." },
+      PAID:           { step: 0, label: "✅ Płatność potwierdzona — startujemy generację..." },
+      GENERATING_AI:  { step: 1, label: "✍️ AI pisze profesjonalne treści wniosku..." },
+      SENDING_EMAIL:  { step: 4, label: "📧 Generujemy DOCX i wysyłamy na Twój email..." },
+      DONE:           { step: 4, label: "✅ Gotowe! Sprawdź swoją skrzynkę email." },
+      ERROR:          { step: 0, label: "❌ Błąd generacji — skontaktujemy się z Tobą." },
+      PAYMENT_FAILED: { step: 0, label: "❌ Płatność nieudana." },
+    };
+
+    const tick = async () => {
+      attempts++;
+      try {
+        const res = await fetch(`${CONFIG.API_BASE}/order-status/${orderIdToPoll}`);
+        if (res.ok) {
+          const order = await res.json();
+          const stage = STAGE_BY_STATUS[order.status] || { step: 1, label: `Status: ${order.status}` };
+          setGenStep(stage.step);
+          setGenStage(stage.label);
+
+          if (order.status === "DONE") {
+            localStorage.removeItem("pup_order_id");
+            setTimeout(() => setStatus("done"), 1500);
+            return;
+          }
+          if (order.status === "ERROR" || order.status === "PAYMENT_FAILED") {
+            setTimeout(() => setStatus("error"), 1500);
+            return;
+          }
+        }
+      } catch (e) {
+        console.warn("Polling error:", e.message);
+      }
+
+      if (attempts < MAX_ATTEMPTS) {
+        setTimeout(tick, 15000);
+      } else {
+        // Po 30 min — pokaż "prawdopodobnie gotowe, sprawdź maila"
+        setStatus("timeout");
+      }
+    };
+    tick();
+  }
 
   const set    = (f, v) => setData(d => ({ ...d, [f]: v }));
   const setArr = (f, i, sf, v) => setData(d => {
@@ -156,457 +223,68 @@ export default function GeneratorPUP() {
     topRef.current?.scrollIntoView({ behavior: "smooth" });
   };
 
-  // ── Płatność HotPay ──────────────────────────────────────
-  const handlePayment = () => {
+  // ── Płatność HotPay (server-driven) ──────────────────────
+  // 1. POST formularza do backendu → backend zapisuje order, zwraca order_id
+  // 2. Frontend submituje formularz HotPay z otrzymanym order_id
+  // 3. Po płatności HotPay wysyła IPN na /hotpay-notify (server-to-server)
+  // 4. Klient wraca na RETURN_URL?order=ID → polling /order-status/:id
+  const handlePayment = async () => {
     if (!regulamin || !rodo) return;
-    localStorage.setItem("pup_order_data", JSON.stringify(data));
-    const form = document.createElement("form");
-    form.method = "POST";
-    form.action = CONFIG.HOTPAY_URL;
-    const fields = {
-      SEKRET: CONFIG.HOTPAY_SEKRET,
-      KWOTA: cena.kwota,                              // ← dynamiczna kwota
-      NAZWA_USLUGI: "Generator wniosku PUP – Wnioski24.pl",
-      ADRES_WWW: CONFIG.RETURN_URL,
-      ID_ZAMOWIENIA: `PUP-${Date.now()}`,
-      EMAIL: data.email,
-      TELEFON: data.telefon,
-      DANE_OSOBOWE: data.imie_nazwisko,
-      ADRES_WWW_BLAD: CONFIG.FAILURE_URL,
-    };
-    Object.entries(fields).forEach(([k, v]) => {
-      const inp = document.createElement("input");
-      inp.type = "hidden"; inp.name = k; inp.value = v;
-      form.appendChild(inp);
-    });
-    document.body.appendChild(form);
-    form.submit();
-  };
-
-  // ── Etapy generowania (wizualne + czasowe) ───────────────
-  const GEN_STAGES = [
-    "🔍 Analiza danych i profilu działalności...",
-    "✍️ Uzupełnianie brakujących sekcji wniosku...",
-    "📊 Generowanie SWOT, planu finansowego i konkurencji...",
-    "📄 Pisanie finalnych treści i budowanie dokumentu DOCX...",
-    "📧 Wysyłka na Twój adres e-mail...",
-  ];
-  // Czas trwania każdego etapu (ms) – łącznie ~7 min
-  const STAGE_DURATIONS = [60000, 90000, 90000, 120000, 60000];
-
-  // ── 2-ETAPOWE GENEROWANIE ───────────────────────────────
-  async function runGeneration(formData) {
-    setStatus("generating");
-    setGenStep(0);
-    setGenStage(GEN_STAGES[0]);
-
-    // Uruchom timer wizualny niezależnie od API
-    let currentStage = 0;
-    const advanceStage = () => {
-      currentStage++;
-      if (currentStage < GEN_STAGES.length) {
-        setGenStep(currentStage);
-        setGenStage(GEN_STAGES[currentStage]);
-        setTimeout(advanceStage, STAGE_DURATIONS[currentStage]);
-      }
-    };
-    setTimeout(advanceStage, STAGE_DURATIONS[0]);
-
-    // KAŻDY krok ma własny try/catch — webhook MUSI się odpalić nawet przy błędzie
-    // AI, żeby Make.com mogło zrobić alert/refund (klient już zapłacił przez HotPay).
-    const order_id = `PUP-${Date.now()}`;
-    let enriched = null;
-    let ai = null;
-    let aiError = null;
-
+    setStatus("creating-order");
     try {
-      enriched = await claudeEnrich(formData);
-    } catch (err) {
-      console.error("claudeEnrich failed:", err);
-      aiError = { stage: "enrich", message: err.message };
-    }
-
-    if (enriched && !aiError) {
-      try {
-        ai = await claudeWrite(formData, enriched);
-      } catch (err) {
-        console.error("claudeWrite failed:", err);
-        aiError = { stage: "write", message: err.message };
-      }
-    }
-
-    const meta = {
-      timestamp: new Date().toISOString(),
-      order_id,
-      email_klienta: formData.email,
-      imie_nazwisko: formData.imie_nazwisko,
-      kwota_wnioskowana: formData.kwota,
-      pkd: `${formData.pkd1_kod} – ${formData.pkd1_nazwa}`,
-      miejscowosc: formData.miejscowosc,
-      suma_wydatkow: sumWyd(formData.wydatki_dotacja),
-      ai_status: aiError ? "error" : "ok",
-      ai_error: aiError,
-    };
-
-    let webhookOk = false;
-    try {
-      const r = await fetch(CONFIG.MAKE_WEBHOOK_URL, {
+      const res = await fetch(`${CONFIG.API_BASE}/order-create`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ formularz: formData, ai_tresc: ai, enriched, meta }),
+        body: JSON.stringify({ formularz: data, amount: cena.kwota }),
       });
-      webhookOk = r.ok;
-      if (!r.ok) console.error("Make webhook non-2xx:", r.status, await r.text().catch(() => ""));
-    } catch (err) {
-      console.error("Make webhook failed:", err);
-    }
-
-    if (aiError || !webhookOk) {
-      setStatus("error");
-      return;
-    }
-
-    localStorage.removeItem("pup_order_data");
-    setGenStep(4);
-    setGenStage(GEN_STAGES[4]);
-    setTimeout(() => setStatus("done"), 2000);
-  }
-
-  // ── Claude API helper z tool_use (wymusza poprawny JSON) + retry ────────
-  // Anthropic gwarantuje że tool_use.input jest poprawnym obiektem zgodnym ze
-  // schemą — eliminuje "Unterminated string" / błędy parsowania JSON z tekstu.
-  async function callClaudeJSON({ prompt, tool, attempts = 2 }) {
-    let lastErr;
-    for (let i = 0; i < attempts; i++) {
-      try {
-        const res = await fetch("https://wnioski24-docx-server.onrender.com/claude", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: "claude-sonnet-4-20250514",
-            max_tokens: 16000,
-            tools: [tool],
-            tool_choice: { type: "tool", name: tool.name },
-            messages: [{ role: "user", content: prompt }],
-          }),
-        });
-        if (!res.ok) {
-          const errBody = await res.text();
-          throw new Error(`Claude API ${res.status}: ${errBody.slice(0, 300)}`);
-        }
-        const data = await res.json();
-        const toolUse = (data.content || []).find(b => b.type === "tool_use");
-        if (toolUse && toolUse.input) return toolUse.input;
-
-        // Fallback: model nie użył tool_use — spróbuj sparsować tekst
-        const raw = (data.content || []).map(b => b.text || "").join("");
-        const cleaned = raw
-          .replace(/```json|```/g, "")
-          .replace(/[\u0000-\u001F\u007F-\u009F]/g, " ")
-          .trim();
-        return JSON.parse(cleaned);
-      } catch (e) {
-        lastErr = e;
-        console.warn(`Claude attempt ${i + 1}/${attempts} failed:`, e.message);
-        if (i < attempts - 1) await new Promise(r => setTimeout(r, 1500 * (i + 1)));
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `Błąd ${res.status}`);
       }
+      const { order_id } = await res.json();
+      localStorage.setItem("pup_order_id", order_id);
+
+      const form = document.createElement("form");
+      form.method = "POST";
+      form.action = CONFIG.HOTPAY_URL;
+      const returnUrl = `${CONFIG.RETURN_URL}&order=${encodeURIComponent(order_id)}`;
+      const fields = {
+        SEKRET: CONFIG.HOTPAY_SEKRET,
+        KWOTA: cena.kwota,
+        NAZWA_USLUGI: "Generator wniosku PUP – Wnioski24.pl",
+        ADRES_WWW: returnUrl,
+        ID_ZAMOWIENIA: order_id,
+        EMAIL: data.email,
+        TELEFON: data.telefon,
+        DANE_OSOBOWE: data.imie_nazwisko,
+        ADRES_WWW_BLAD: CONFIG.FAILURE_URL,
+      };
+      Object.entries(fields).forEach(([k, v]) => {
+        const inp = document.createElement("input");
+        inp.type = "hidden"; inp.name = k; inp.value = v;
+        form.appendChild(inp);
+      });
+      document.body.appendChild(form);
+      form.submit();
+    } catch (err) {
+      console.error("order-create failed:", err);
+      alert("Nie udało się zapisać zamówienia: " + err.message + ". Spróbuj ponownie.");
+      setStatus("form");
     }
-    throw lastErr;
-  }
+  };
 
-  // ── ETAP 1: Uzupełnianie braków + opodatkowanie + 12M plan ─
-  async function claudeEnrich(f) {
-    const miasto = f.miejscowosc || "w Polsce";
-    const maFinanse = !f.finanse_skip && f.przychody.some(r => r.kwota);
-    const przychodBaza = maFinanse
-      ? f.przychody.reduce((s, r) => s + (parseFloat(r.kwota) || 0), 0)
-      : null;
-
-    const prompt = `Jesteś ekspertem od wniosków o dotacje z Urzędu Pracy (PUP) w Polsce
-oraz doradcą podatkowym dla małych firm.
-
-WAŻNE ZASADY:
-- NIE używaj nazw konkretnych miast ani urzędów pracy w treściach wniosku
-- Konkurentów dobierz z okolicy: ${miasto} – podaj realne, istniejące firmy
-- Dane branżowe dotyczą całej Polski, nie konkretnego miasta
-- Pisz w pierwszej osobie liczby pojedynczej
-- WAŻNE: Odpowiadaj TYLKO czystym JSON bez żadnych komentarzy, apostrofów w kluczach, znaków nowej linii wewnątrz wartości. Każda wartość string musi być w podwójnych cudzysłowach. Nie używaj apostrofów ani cudzysłowów wewnątrz wartości tekstowych.
-
-DANE OD KLIENTA:
-PKD: ${f.pkd1_kod} – ${f.pkd1_nazwa}
-${f.pkd2_kod ? `PKD poboczne: ${f.pkd2_kod} – ${f.pkd2_nazwa}` : ""}
-Kwota dotacji: ${f.kwota} zł
-Termin: ${f.termin_podjecia || "nie podano"}
-Opis: ${f.opis_biznesu}
-Branża: ${f.branza || "nie podano"}
-Miejscowość: ${miasto}
-Lokal: ${f.adres_dzialalnosci || "praca zdalna"} (${f.status_lokalu || ""})
-Klienci: ${f.klienci_skip ? "wygeneruj" : `${f.grupy_klientow} | ${f.sposob_pozyskania}`}
-Przychód bazowy (mies.): ${przychodBaza ? przychodBaza + " zł" : "wygeneruj realistyczny dla tej branży"}
-Koszty stałe: ${f.finanse_skip ? "wygeneruj" : f.koszty_stale?.map(r => `${r.nazwa} ${r.kwota}zł`).join(", ") || "wygeneruj"}
-SWOT: ${f.swot_skip ? "wygeneruj" : `mocne: ${f.mocne.filter(Boolean).join(", ")}`}
-Konkurencja: ${f.konkurencja_skip ? `wygeneruj 3 firmy z ${miasto}` : f.konkurencja.filter(k => k.nazwa).map(k => k.nazwa).join(", ") || `wygeneruj 3 firmy z ${miasto}`}
-Plan działań: ${f.plan_skip ? "wygeneruj" : f.plan_dzialan.filter(p => p.dzialanie).map(p => p.dzialanie).join(", ") || "wygeneruj"}
-Zatrudnienie: ${f.zatrudnienie === "tak" ? f.zatrudnienie_szczegoly : "jednoosobowo"}
-Dodatkowe: ${f.dodatkowe_info || "brak"}
-
-ZADANIE 1 – DOBÓR FORMY OPODATKOWANIA:
-Na podstawie PKD ${f.pkd1_kod} (${f.pkd1_nazwa}) dobierz najkorzystniejszą formę opodatkowania.
-Zasady doboru:
-- Ryczałt ewidencjonowany: handel (PKD 45-47) 3%, gastronomia (PKD 56) 3%, IT/programowanie (PKD 62.01) 12%, usługi różne 8,5%, wolne zawody 17%
-- Podatek liniowy 19%: opłacalny gdy koszty > 50% przychodu i przychody > 150 000 zł/rok
-- Skala podatkowa 12%/32%: gdy dochód roczny < 120 000 zł i duże koszty
-- Uwzględnij składkę zdrowotną: ryczałt – ryczałtowa, liniowy – 4,9% dochodu, skala – 9% dochodu
-- ZUS preferencyjny przez pierwsze 24 miesiące: ~330 zł (bez chorobowego), po 24 mies. pełny ~1600 zł
-- NFZ: zależy od formy, przy ryczałcie – stała kwota ok. 381–572 zł
-
-ZADANIE 2 – PLAN FINANSOWY 12 MIESIĘCY:
-Wygeneruj realistyczny plan z WZROSTEM co kwartał (Q2 +15%, Q3 +32%, Q4 +52% vs Q1).
-Każdy miesiąc zawiera: 2-3 źródła przychodów, koszty stałe, koszty zmienne, podatek, ZUS+NFZ, dochód netto.
-${przychodBaza ? `Baza przychodów Q1: ${przychodBaza} zł/mies. (podane przez klienta)` : "Dobierz realistyczną bazę dla tej branży i miejscowości."}
-
-ZADANIE 3 – TREŚCI MERYTORYCZNE (uzupełnij brakujące):
-Wygeneruj brakujące sekcje opisowe wniosku.
-
-Odpowiedz TYLKO jako JSON (zero markdown, zero backtick-ów):
-{
-  "opodatkowanie": {
-    "forma": "nazwa formy np. Ryczałt ewidencjonowany",
-    "stawka": "np. 8,5%",
-    "podstawa": "przychód lub dochód",
-    "zus_miesiac": 330,
-    "nfz_miesiac": 381,
-    "uzasadnienie": "3-4 zdania dlaczego ta forma jest najlepsza dla tej branży i PKD"
-  },
-  "plan_12m": [
-    {
-      "miesiac": 1,
-      "nazwa_miesiaca": "Styczeń",
-      "przychody": [
-        {"nazwa": "źródło 1", "kwota": 0},
-        {"nazwa": "źródło 2", "kwota": 0}
-      ],
-      "suma_przychodow": 0,
-      "koszty_stale": 0,
-      "koszty_zmienne": 0,
-      "podatek": 0,
-      "zus_nfz": 0,
-      "dochod_netto": 0
-    }
-  ],
-  "cel_przedsiewziecia": "2 zdania",
-  "motywacja": "2-3 zdania",
-  "opis_glownej": "3-4 zdania",
-  "opis_pobocznej": "2 zdania lub pusty string",
-  "zrodlo_pomyslu": "2 zdania",
-  "plany_rozwoju": "3 zdania",
-  "termin_podjecia": "miesiąc rok",
-  "branza_opis": "3-4 zdania z liczbami",
-  "grupy_klientow": "2-3 zdania",
-  "charakterystyka_klientow": "2-3 zdania",
-  "popyt_uzasadnienie": "2-3 zdania",
-  "sposob_pozyskania": "2-3 zdania",
-  "metody_utrzymania": "2 zdania",
-  "lokalizacja_opis": "2-3 zdania",
-  "sposob_zarzadzania": "2-3 zdania",
-  "dostawcy": "2-3 zdania",
-  "roznice_konkurencja": "3 zdania",
-  "swot_mocne": ["p1","p2","p3","p4","p5"],
-  "swot_slabe": ["p1","p2","p3"],
-  "swot_szanse": ["p1","p2","p3","p4"],
-  "swot_zagrozenia": ["p1","p2","p3"],
-  "konkurencja_3": [
-    {"nazwa": "firma z ${miasto}","adres": "miasto","opis": "zakres"},
-    {"nazwa": "firma z ${miasto}","adres": "miasto","opis": "zakres"},
-    {"nazwa": "firma z ${miasto}","adres": "miasto","opis": "zakres"}
-  ],
-  "plan_dzialan_tabela": [
-    {"termin": "mies. rok","dzialanie": "opis","efekt": "efekt"},
-    {"termin": "mies. rok","dzialanie": "opis","efekt": "efekt"},
-    {"termin": "mies. rok","dzialanie": "opis","efekt": "efekt"},
-    {"termin": "mies. rok","dzialanie": "opis","efekt": "efekt"},
-    {"termin": "mies. rok","dzialanie": "opis","efekt": "efekt"}
-  ],
-  "uzasadnienie_finansowe": "4 zdania uzasadniające prognozy i wzrost"
-}`;
-
-    const enrichTool = {
-      name: "wniosek_enrich",
-      description: "Uzupełnia brakujące pola wniosku PUP: opodatkowanie, plan 12 miesięcy, treści merytoryczne, SWOT, konkurencja.",
-      input_schema: {
-        type: "object",
-        properties: {
-          opodatkowanie: {
-            type: "object",
-            properties: {
-              forma: { type: "string" },
-              stawka: { type: "string" },
-              podstawa: { type: "string" },
-              zus_miesiac: { type: "number" },
-              nfz_miesiac: { type: "number" },
-              uzasadnienie: { type: "string" },
-            },
-            required: ["forma", "stawka", "podstawa", "zus_miesiac", "nfz_miesiac", "uzasadnienie"],
-          },
-          plan_12m: {
-            type: "array",
-            minItems: 12,
-            maxItems: 12,
-            items: {
-              type: "object",
-              properties: {
-                miesiac: { type: "integer" },
-                nazwa_miesiaca: { type: "string" },
-                przychody: {
-                  type: "array",
-                  items: {
-                    type: "object",
-                    properties: { nazwa: { type: "string" }, kwota: { type: "number" } },
-                    required: ["nazwa", "kwota"],
-                  },
-                },
-                suma_przychodow: { type: "number" },
-                koszty_stale: { type: "number" },
-                koszty_zmienne: { type: "number" },
-                podatek: { type: "number" },
-                zus_nfz: { type: "number" },
-                dochod_netto: { type: "number" },
-              },
-              required: ["miesiac", "nazwa_miesiaca", "przychody", "suma_przychodow", "koszty_stale", "koszty_zmienne", "podatek", "zus_nfz", "dochod_netto"],
-            },
-          },
-          cel_przedsiewziecia: { type: "string" },
-          motywacja: { type: "string" },
-          opis_glownej: { type: "string" },
-          opis_pobocznej: { type: "string" },
-          zrodlo_pomyslu: { type: "string" },
-          plany_rozwoju: { type: "string" },
-          termin_podjecia: { type: "string" },
-          branza_opis: { type: "string" },
-          grupy_klientow: { type: "string" },
-          charakterystyka_klientow: { type: "string" },
-          popyt_uzasadnienie: { type: "string" },
-          sposob_pozyskania: { type: "string" },
-          metody_utrzymania: { type: "string" },
-          lokalizacja_opis: { type: "string" },
-          sposob_zarzadzania: { type: "string" },
-          dostawcy: { type: "string" },
-          roznice_konkurencja: { type: "string" },
-          swot_mocne: { type: "array", items: { type: "string" } },
-          swot_slabe: { type: "array", items: { type: "string" } },
-          swot_szanse: { type: "array", items: { type: "string" } },
-          swot_zagrozenia: { type: "array", items: { type: "string" } },
-          konkurencja_3: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                nazwa: { type: "string" },
-                adres: { type: "string" },
-                opis: { type: "string" },
-              },
-              required: ["nazwa", "adres", "opis"],
-            },
-          },
-          plan_dzialan_tabela: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                termin: { type: "string" },
-                dzialanie: { type: "string" },
-                efekt: { type: "string" },
-              },
-              required: ["termin", "dzialanie", "efekt"],
-            },
-          },
-          uzasadnienie_finansowe: { type: "string" },
-        },
-        required: ["opodatkowanie", "plan_12m", "cel_przedsiewziecia", "motywacja", "opis_glownej", "swot_mocne", "swot_slabe", "swot_szanse", "swot_zagrozenia", "konkurencja_3", "plan_dzialan_tabela", "uzasadnienie_finansowe"],
-      },
-    };
-
-    return await callClaudeJSON({ prompt, tool: enrichTool });
-  }
-
-  // ── ETAP 2: Profesjonalne treści ─────────────────────────
-  async function claudeWrite(f, enriched) {
-    const miasto = f.miejscowosc || "w Polsce";
-    const opod = enriched.opodatkowanie || {};
-    const prompt = `Jesteś doświadczonym konsultantem biznesowym piszącym wnioski o dofinansowanie
-z Urzędu Pracy w Polsce. Napisz PROFESJONALNE, ROZBUDOWANE i PRZEKONUJĄCE treści.
-
-KLUCZOWE ZASADY:
-- NIE wymieniaj żadnej konkretnej nazwy urzędu pracy ani miasta w treściach
-- Pisz ogólnie: "lokalny rynek", "okolica", "region"
-- Każda sekcja: min. 4-5 zdań, formalny język, pierwsza osoba l. poj.
-- Kontekst rynkowy: ${miasto}
-
-DANE BAZOWE:
-PKD: ${f.pkd1_kod} – ${f.pkd1_nazwa}
-Kwota dotacji: ${f.kwota} zł
-Opis klienta: ${f.opis_biznesu}
-Forma opodatkowania: ${opod.forma || "ryczałt"} (${opod.stawka || ""})
-Uzasadnienie opodatkowania: ${opod.uzasadnienie || ""}
-
-DANE Z ETAPU 1:
-${JSON.stringify(enriched, null, 2)}
-
-Odpowiedz TYLKO jako JSON (zero markdown):
-{
-  "s1_cel": "min. 4 zdania – cel i uzasadnienie",
-  "s1_motywacja": "min. 4 zdania – motywacja zawodowa i osobista",
-  "s1_plany": "min. 4 zdania – plany rozwoju na 3 lata z konkretnymi celami",
-  "s1_opis_glownej": "min. 5 zdań – szczegółowy opis działalności",
-  "s1_opis_pobocznej": "min. 3 zdania lub pusty string",
-  "s1_zrodlo": "min. 3 zdania – źródło pomysłu",
-  "s1_rynek": "min. 5 zdań – analiza rynku z danymi ogólnopolskimi",
-  "s1_branza": "min. 5 zdań – opis branży z liczbami",
-  "s1_roznice": "min. 4 zdania – wyróżniki na tle konkurencji",
-  "s1_przewaga": "min. 3 zdania – przewaga konkurencji i plan minimalizacji",
-  "s2_grupy": "min. 3 zdania – grupy klientów",
-  "s2_charakterystyka": "min. 3 zdania – charakterystyka klientów",
-  "s2_popyt": "min. 3 zdania – uzasadnienie popytu",
-  "s2_pozyskanie": "min. 4 zdania – strategia pozyskania klientów",
-  "s2_utrzymanie": "min. 3 zdania – metody utrzymania klientów",
-  "s3_lokalizacja": "min. 3 zdania – opis lokalizacji",
-  "s3_plusy_minusy": "min. 3 zdania – plusy i minusy",
-  "s3_wplyw": "min. 3 zdania – wpływ lokalizacji na biznes",
-  "s4_zarzadzanie": "min. 3 zdania – sposób zarządzania",
-  "s4_dostawcy": "min. 3 zdania – dostawcy i współpraca",
-  "plan_dzialan_opis": "min. 2 zdania – wprowadzenie do harmonogramu",
-  "opodatkowanie_uzasadnienie": "min. 4 zdania – dlaczego wybrana forma opodatkowania jest najkorzystniejsza, uwzględnij składkę zdrowotną i ZUS",
-  "finanse_uzasadnienie": "min. 4 zdania – uzasadnienie prognoz z uwzględnieniem wzrostu 15% co kwartał i wybranej formy opodatkowania",
-  "wydatki_uzasadnienie": "min. 3 zdania – uzasadnienie całości wydatków z dotacji"
-}`;
-
-    const writeFields = [
-      "s1_cel","s1_motywacja","s1_plany","s1_opis_glownej","s1_opis_pobocznej",
-      "s1_zrodlo","s1_rynek","s1_branza","s1_roznice","s1_przewaga",
-      "s2_grupy","s2_charakterystyka","s2_popyt","s2_pozyskanie","s2_utrzymanie",
-      "s3_lokalizacja","s3_plusy_minusy","s3_wplyw",
-      "s4_zarzadzanie","s4_dostawcy",
-      "plan_dzialan_opis","opodatkowanie_uzasadnienie","finanse_uzasadnienie","wydatki_uzasadnienie",
-    ];
-    const writeProperties = Object.fromEntries(writeFields.map(k => [k, { type: "string" }]));
-
-    const writeTool = {
-      name: "wniosek_write",
-      description: "Generuje profesjonalne treści narracyjne wniosku PUP – wszystkie sekcje pisane w pierwszej osobie l. poj.",
-      input_schema: {
-        type: "object",
-        properties: writeProperties,
-        required: writeFields.filter(k => k !== "s1_opis_pobocznej"),
-      },
-    };
-
-    return await callClaudeJSON({ prompt, tool: writeTool });
-  }
+  // ── Generacja AI + DOCX została przeniesiona na serwer ──
+  //   /order-create  → backend zapisuje formularz
+  //   /hotpay-notify → HotPay IPN wyzwala asynchroniczną generację
+  //   /order-status/:id → frontend polluje stan
+  // Klient może zamknąć kartę po płatności — generacja idzie dalej.
 
   // ── Render ────────────────────────────────────────────────
-  if (status === "generating") return <StatusScreen type="generating" stage={genStage} genStep={genStep} />;
-  if (status === "done")       return <StatusScreen type="done" email={data.email} />;
-  if (status === "error")      return <StatusScreen type="error" onRetry={() => setStatus("form")} />;
+  if (status === "creating-order") return <StatusScreen type="creating-order" />;
+  if (status === "generating")     return <StatusScreen type="generating" stage={genStage} genStep={genStep} email={data.email} />;
+  if (status === "done")           return <StatusScreen type="done" email={data.email} />;
+  if (status === "timeout")        return <StatusScreen type="timeout" email={data.email} />;
+  if (status === "error")          return <StatusScreen type="error" onRetry={() => setStatus("form")} />;
 
   return (
     <div style={S.app} ref={topRef}>
@@ -1265,21 +943,66 @@ function StepZamowienie({ data, sumWyd, regulamin, setRegulamin, rodo, setRodo, 
 // ============================================================
 function StatusScreen({ type, email, stage, genStep, onRetry }) {
   const STAGES = [
-    "Analiza danych i profilu działalności",
-    "Uzupełnianie brakujących sekcji wniosku",
-    "Generowanie SWOT, planu finansowego i konkurencji",
-    "Pisanie finalnych treści i budowanie dokumentu DOCX",
-    "Wysyłka na Twój adres e-mail",
+    "Płatność potwierdzona",
+    "AI pisze treści wniosku (5–25 min)",
+    "Budowanie dokumentu DOCX",
+    "Wysyłka na e-mail",
+    "Gotowe",
   ];
 
   const MAP = {
+    "creating-order": {
+      icon: "💾", color: C.gold,
+      title: "Zapisujemy Twoje zamówienie…",
+      sub: "Za chwilę zostaniesz przekierowany do bramki płatności HotPay.",
+      extra: (
+        <div style={{ marginTop: 28 }}>
+          <div style={S.spinner} />
+        </div>
+      ),
+    },
     generating: {
       icon: "⚙️", color: C.gold,
-      title: "Przygotowujemy Twój wniosek…",
-      sub: "Narzędzie analizuje dane i pisze profesjonalne treści. Nie zamykaj tej strony.",
+      title: stage || "Przygotowujemy Twój wniosek…",
+      sub: "",
       extra: (
-        <div style={{ marginTop: 28, maxWidth: 400, margin: "28px auto 0" }}>
+        <div style={{ marginTop: 24, maxWidth: 460, margin: "24px auto 0" }}>
+          {/* GŁÓWNY BOX z informacją o czasie + zamknięciu karty */}
+          <div style={{
+            background: "linear-gradient(135deg, #fef3c7 0%, #fde68a 100%)",
+            border: `2px solid ${C.gold}`,
+            borderRadius: 12,
+            padding: 20,
+            marginBottom: 24,
+            textAlign: "left",
+            boxShadow: "0 4px 14px rgba(200,146,42,0.18)",
+          }}>
+            <p style={{ fontSize: 16, color: "#78350f", fontWeight: 700, margin: "0 0 10px 0", lineHeight: 1.4 }}>
+              ⏱ Generowanie wniosku może potrwać do <span style={{ fontSize: 19 }}>30 minut</span>
+            </p>
+            <p style={{ fontSize: 14, color: "#92400e", margin: "0 0 12px 0", lineHeight: 1.6 }}>
+              AI tworzy profesjonalne treści (~12 sekcji opisowych, plan finansowy 12 miesięcy,
+              SWOT, konkurencja). Następnie składamy DOCX i wysyłamy na Twój e-mail.
+            </p>
+            <div style={{
+              background: "rgba(255,255,255,0.7)",
+              borderRadius: 8,
+              padding: "10px 14px",
+              borderLeft: `4px solid #065f46`,
+            }}>
+              <p style={{ fontSize: 13, color: "#065f46", fontWeight: 600, margin: 0, lineHeight: 1.5 }}>
+                ✅ Możesz spokojnie zamknąć tę kartę
+              </p>
+              <p style={{ fontSize: 12, color: "#047857", margin: "4px 0 0 0", lineHeight: 1.5 }}>
+                Generacja działa po stronie serwera — nawet jeśli wyłączysz przeglądarkę,
+                wniosek dotrze na adres <strong>{email || "Twój e-mail"}</strong> najpóźniej za pół godziny.
+              </p>
+            </div>
+          </div>
+
           <div style={S.spinner} />
+
+          {/* Lista etapów */}
           <div style={{ marginTop: 24, display: "flex", flexDirection: "column", gap: 10 }}>
             {STAGES.map((s, i) => {
               const done    = i < (genStep || 0);
@@ -1303,13 +1026,23 @@ function StatusScreen({ type, email, stage, genStep, onRetry }) {
               );
             })}
           </div>
-          <div style={{ marginTop: 28, background: "#fffbeb", border: `1px solid ${C.gold}`, borderRadius: 8, padding: 14, textAlign: "left" }}>
-            <p style={{ fontSize: 13, color: "#92400e", margin: 0 }}>
-              ⏱ <strong>Czas oczekiwania: 5–10 minut.</strong> Wniosek jest generowany
-              i szczegółowo opracowywany przez nasz system. Po zakończeniu otrzymasz
-              plik DOCX na podany adres e-mail – możesz zamknąć tę kartę.
-            </p>
-          </div>
+
+          <p style={{ marginTop: 24, fontSize: 12, color: "#6b7280", textAlign: "center" }}>
+            Status odświeża się automatycznie co 15 sekund.
+          </p>
+        </div>
+      ),
+    },
+    timeout: {
+      icon: "📬", color: C.gold,
+      title: "Generacja trwa dłużej niż zwykle",
+      sub: "Sprawdź swoją skrzynkę e-mail — wniosek powinien już tam być.",
+      extra: (
+        <div style={{ textAlign: "center", marginTop: 20 }}>
+          <p style={{ fontSize: 14, color: "#374151", lineHeight: 1.7 }}>
+            Jeśli e-mail nie dotarł w ciągu kolejnych 10 minut, skontaktuj się z nami:<br/>
+            <strong>kontakt@wnioski24.pl</strong> i podaj numer zamówienia.
+          </p>
         </div>
       ),
     },
